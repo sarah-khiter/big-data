@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   # ---------------------------------------------------------------
   # KAFKA (mode KRaft, sans ZooKeeper) — deux listeners :
@@ -27,7 +25,9 @@ services:
   # SPARK STANDALONE (1 master, 1 worker) — 2G/2 coeurs pour tenir sur 16 Go de RAM
   # ---------------------------------------------------------------
   spark-master:
-    image: apache/spark:3.5.1-python3
+    build:
+      context: ./docker
+      dockerfile: spark-master.Dockerfile
     container_name: capteurs-spark-master
     hostname: spark-master
     environment:
