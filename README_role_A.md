@@ -1,52 +1,44 @@
 # Rôle A — Infra & Référentiel
 
-Ce dossier contient tout ce qu'il faut pour démarrer l'infra du projet.
-À faire en premier : B, C et D dépendent de ça pour commencer.
+Ce document explique ce qui a été mis en place côté infra, comment le relancer,
+et ce qu'il faut savoir avant de brancher B, C ou D dessus.
 
-## Structure livrée
+> ⚠️ Ceci **n'est pas le README final du projet**. C'est un doc de travail
+> interne au rôle A. Le README final unique (`README.md` à la racine) est le
+> seul livrable évalué — chacun doit y reporter sa partie (voir le squelette
+> fourni séparément).
+
+## Ce qui a été livré
 
 ```
-projet/
-├── docker-compose.yml
-├── referentiel/
-│   ├── sites.csv
-│   ├── machines.csv
-│   └── capteurs.csv
-├── sql/
-│   └── init_schema.sql
+big-data/
+├── docker-compose.yml       # Kafka (KRaft), Spark standalone (master+worker), Postgres
+├── sql/init_schema.sql      # schéma gold : 3 dimensions + 2 tables de faits/agrégats
 ├── scripts/
-│   ├── generate_referentiel.py   # a produit les 3 CSV ci-dessus (rejouable)
-│   └── load_referentiel.py       # charge les CSV dans Postgres
-├── jobs/          # <- vide, à remplir par B/C/D (bronze.py, silver.py, gold_*.py)
-└── lakehouse/      # <- stockage des tables Delta (bronze/silver/gold)
+│   ├── generate_referentiel.py   # a produit les 3 CSV (rejouable si les IDs changent)
+│   └── load_referentiel.py       # charge les CSV dans Postgres (upsert)
+├── referentiel/
+│   ├── sites.csv       # 2 sites : site-lyon, site-nantes
+│   ├── machines.csv    # 6 machines : m-01 à m-06
+│   └── capteurs.csv    # 24 capteurs : cpt-001 à cpt-024 (4 par machine)
+├── jobs/       # <- vide, à remplir par B (bronze.py), C (silver.py, gold_agg.py), D (gold_etat.py)
+└── lakehouse/  # <- stockage des tables Delta, généré à l'exécution (ignoré par git)
 ```
 
-## Commandes, dans l'ordre
-
-### 1. Lancer l'infra
+## Commandes pour relancer l'infra depuis zéro
 
 ```bash
-cd projet
+cd big-data
 docker compose up -d
-docker compose ps
+docker compose ps   # vérifier que les 4 conteneurs sont "Up"
 ```
 
-Vérifier que les 4 services sont up : `capteurs-kafka`, `capteurs-spark-master`,
-`capteurs-spark-worker-1`, `capteurs-postgres`.
-
-### 2. Créer le schéma Postgres (gold : dimensions + faits)
-
+### Créer le schéma Postgres (une seule fois, ou après un volume reset)
 ```bash
 docker exec -i capteurs-postgres psql -U capteurs -d capteurs < sql/init_schema.sql
 ```
 
-Vérification :
-```bash
-docker exec -it capteurs-postgres psql -U capteurs -d capteurs -c "\dt gold.*"
-```
-
-### 3. Charger le référentiel dans Postgres
-
+### Charger le référentiel (une seule fois, ou si le référentiel change)
 ```bash
 python3 -m venv ~/venv-projet
 source ~/venv-projet/bin/activate
@@ -54,50 +46,96 @@ pip install psycopg2-binary
 python3 scripts/load_referentiel.py
 ```
 
-Vérification :
-```bash
-docker exec -it capteurs-postgres psql -U capteurs -d capteurs -c "SELECT * FROM gold.dim_machine;"
-```
-
-### 4. Préparer le conteneur Spark master (delta-spark + psycopg2)
-
+### Préparer Spark master pour Delta + écriture Postgres
 ```bash
 docker exec -u root -it capteurs-spark-master pip install delta-spark==3.2.0 psycopg2-binary
 ```
+⚠️ **Cette installation n'est pas persistée** : si quelqu'un fait
+`docker compose down` puis `up` (recréation du conteneur, pas juste un restart),
+il faut la refaire. À améliorer avec un `Dockerfile` custom si on a le temps
+(voir section Incident).
 
-(delta-spark seulement sur spark-master : c'est là que tourne le driver au
-`spark-submit`. Les JARs Java sont ensuite distribués automatiquement au worker
-via `spark.jars.packages`.)
+## Preuves que l'infra fonctionne (capturées le 09/07)
 
-### 5. Vérifier l'accessibilité Kafka / Spark UI / Postgres
+**Conteneurs up :**
+```
+NAME                      STATUS
+capteurs-kafka            Up (127.0.0.1:9092)
+capteurs-postgres         Up (127.0.0.1:5432)
+capteurs-spark-master     Up (127.0.0.1:4040, 7077, 8080)
+capteurs-spark-worker-1   Up
+```
 
-- Spark master UI : http://localhost:8080
-- Spark job UI (une fois un job lancé) : http://localhost:4040
-- Kafka : accessible sur `localhost:9092` depuis l'hôte (générateur), sur
-  `kafka:29092` depuis les conteneurs Spark
-- Postgres : accessible sur `localhost:5432` depuis l'hôte (Power BI Desktop
-  tourne hors Docker, donc directement dessus)
+**Schéma Postgres créé (`\dt gold.*`) :**
+```
+ Schema |         Name         | Type  |  Owner
+--------+----------------------+-------+----------
+ gold   | agg_fenetre_machine  | table | capteurs
+ gold   | dim_capteur          | table | capteurs
+ gold   | dim_machine          | table | capteurs
+ gold   | dim_site             | table | capteurs
+ gold   | etat_courant_capteur | table | capteurs
+(5 rows)
+```
 
-## Points à transmettre à B / C / D
+**Référentiel chargé (`SELECT * FROM gold.dim_machine;`) :**
+```
+ machine_id |    type_machine    | ligne_production | criticite | ... | site_id
+------------+--------------------+------------------+-----------+-----+-------------
+ m-01       | presse hydraulique | ligne-A          | haute     | ... | site-lyon
+ m-02       | convoyeur          | ligne-A          | moyenne   | ... | site-lyon
+ m-03       | compresseur        | ligne-B          | haute     | ... | site-lyon
+ m-04       | presse hydraulique | ligne-C          | haute     | ... | site-nantes
+ m-05       | convoyeur          | ligne-C          | basse     | ... | site-nantes
+ m-06       | compresseur        | ligne-D          | moyenne   | ... | site-nantes
+(6 rows)
+```
 
-- Les IDs du référentiel sont : sites `site-lyon`, `site-nantes` ; machines
-  `m-01` à `m-06` ; capteurs `cpt-001` à `cpt-024` (4 par machine : 2
-  température, 1 vibration, 1 pression).
-- **⚠️ Quand le générateur officiel sera fourni**, comparer ses IDs à ceux-ci.
-  S'ils diffèrent, ajuster les listes `SITES` / `MACHINES` / `CAPTEURS` dans
-  `scripts/generate_referentiel.py`, relancer le script, puis rejouer
-  `load_referentiel.py`.
-- Table `gold.agg_fenetre_machine` : clé primaire `(machine_id, window_start)`
-  → pour C, upsert avec `ON CONFLICT (machine_id, window_start) DO UPDATE`.
-- Table `gold.etat_courant_capteur` : clé primaire `capteur_id` → pour D,
-  upsert avec `ON CONFLICT (capteur_id) DO UPDATE`.
-- Le chemin `/lakehouse/...` est un volume partagé entre spark-master et
-  spark-worker-1 (bind mount `./lakehouse`) — pas de vrai HDFS ici, choix
-  assumé pour un environnement laptop 16 Go (à justifier dans le README final,
-  section Architecture).
+## À transmettre à B, C, D
 
-## Incident rencontré (à compléter au fil du projet)
+- **Réseau Kafka** : `localhost:9092` depuis l'hôte (générateur), `kafka:29092`
+  depuis les conteneurs Spark.
+- **IDs disponibles** : sites `site-lyon`/`site-nantes` ; machines `m-01` à
+  `m-06` ; capteurs `cpt-001` à `cpt-024` (2 température + 1 vibration + 1
+  pression par machine).
+- **Tables Postgres prêtes** pour les upserts Gold :
+  - `gold.agg_fenetre_machine` — PK `(machine_id, window_start)` → pour C,
+    `ON CONFLICT (machine_id, window_start) DO UPDATE`
+  - `gold.etat_courant_capteur` — PK `capteur_id` → pour D,
+    `ON CONFLICT (capteur_id) DO UPDATE`
+  - Dimensions déjà peuplées : `dim_capteur`, `dim_machine`, `dim_site`
+- **Chemin Delta** : `/lakehouse/...` dans les conteneurs Spark (volume
+  partagé bind mount `./lakehouse`), pas de vrai HDFS — choix assumé pour un
+  environnement laptop 16 Go.
+- **⚠️ Conflits de port fréquents** : si vous avez d'anciens TP qui tournent
+  encore (Spark/Airflow/HDFS d'un TP précédent), `docker compose up` peut
+  échouer sur les ports `7077`/`8080`/`9092`/`5432`. Voir Incident ci-dessous
+  pour la marche à suivre.
 
-*(Section à tenir à jour par toute l'équipe — noter ici tout problème réel
-rencontré côté infra : conflit de port, volume non accessible en écriture,
-conteneur qui ne démarre pas, etc.)*
+## Incident rencontré
+
+**Problème** : au premier `docker compose up -d`, deux conflits de port
+successifs :
+- `7077` déjà utilisé → conteneur `spark-master` d'un ancien TP (HDFS/Spark)
+  encore actif depuis 21h
+- `8080` déjà utilisé → conteneur `tp-lakehouse-airflow-webserver-1` d'un
+  autre TP encore actif
+
+**Diagnostic** : `lsof -i :<port>` confirmait que c'était Docker qui tenait le
+port (pas un process Mac natif), puis `docker ps -a` a permis d'identifier les
+conteneurs orphelins d'anciens TP qui tournaient toujours en parallèle.
+
+**Résolution** :
+```bash
+docker stop spark-master tp-lakehouse-airflow-webserver-1
+docker compose up -d
+```
+Puis nettoyage plus large des anciens TP pour éviter d'autres conflits
+(`namenode`, `datanode1`, `datanode3`, `spark-worker`, `tp-lakehouse-*`) —
+arrêtés (`docker stop`, pas supprimés) pour libérer la RAM sur la contrainte
+16 Go du laptop.
+
+**Leçon** : sur un environnement partagé/laptop perso où plusieurs TP du
+semestre ont pu laisser des conteneurs actifs en arrière-plan, toujours
+vérifier `docker ps -a` avant un premier `docker compose up` sur un nouveau
+projet.
