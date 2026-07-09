@@ -1,19 +1,19 @@
-# Rôle A — Infra & Référentiel
+Voici le contenu complet à copier-coller directement dans README_role_A.md (remplace tout le contenu existant du fichier) :
+markdown# Rôle A — Infra & Référentiel
 
 Ce document explique ce qui a été mis en place côté infra, comment le relancer,
 et ce qu'il faut savoir avant de brancher B, C ou D dessus.
 
 > ⚠️ Ceci **n'est pas le README final du projet**. C'est un doc de travail
 > interne au rôle A. Le README final unique (`README.md` à la racine) est le
-> seul livrable évalué — chacun doit y reporter sa partie (voir le squelette
-> fourni séparément).
+> seul livrable évalué — chacun doit y reporter sa partie.
 
 ## Ce qui a été livré
-
-```
 big-data/
-├── docker-compose.yml       # Kafka (KRaft), Spark standalone (master+worker), Postgres
-├── sql/init_schema.sql      # schéma gold : 3 dimensions + 2 tables de faits/agrégats
+├── docker-compose.yml            # Kafka (KRaft), Spark standalone (master+worker), Postgres
+├── docker/
+│   └── spark-master.Dockerfile   # image custom : delta-spark + psycopg2 figés
+├── sql/init_schema.sql           # schéma gold : 3 dimensions + 2 tables de faits/agrégats
 ├── scripts/
 │   ├── generate_referentiel.py   # a produit les 3 CSV (rejouable si les IDs changent)
 │   └── load_referentiel.py       # charge les CSV dans Postgres (upsert)
@@ -23,13 +23,12 @@ big-data/
 │   └── capteurs.csv    # 24 capteurs : cpt-001 à cpt-024 (4 par machine)
 ├── jobs/       # <- vide, à remplir par B (bronze.py), C (silver.py, gold_agg.py), D (gold_etat.py)
 └── lakehouse/  # <- stockage des tables Delta, généré à l'exécution (ignoré par git)
-```
 
 ## Commandes pour relancer l'infra depuis zéro
 
 ```bash
 cd big-data
-docker compose up -d
+docker compose up -d --build
 docker compose ps   # vérifier que les 4 conteneurs sont "Up"
 ```
 
@@ -46,50 +45,55 @@ pip install psycopg2-binary
 python3 scripts/load_referentiel.py
 ```
 
-### Préparer Spark master pour Delta + écriture Postgres
+### Spark master : delta-spark + psycopg2 déjà inclus
+Plus besoin d'installer quoi que ce soit à la main : `spark-master` est
+construit depuis `docker/spark-master.Dockerfile`, qui fige `delta-spark==3.2.0`
+et `psycopg2-binary` dans l'image. Ça survit à un `docker compose down`/`up`
+complet (contrairement à un `docker exec -u root pip install`, qui se perdait
+à chaque recréation du conteneur — voir Incident).
+
+Si tu modifies ce Dockerfile, reconstruis l'image avec :
 ```bash
-docker exec -u root -it capteurs-spark-master pip install delta-spark==3.2.0 psycopg2-binary
+docker compose build spark-master
+docker compose up -d
 ```
-⚠️ **Cette installation n'est pas persistée** : si quelqu'un fait
-`docker compose down` puis `up` (recréation du conteneur, pas juste un restart),
-il faut la refaire. À améliorer avec un `Dockerfile` custom si on a le temps
-(voir section Incident).
+
+Vérification que les paquets sont bien présents :
+```bash
+docker exec -it capteurs-spark-master python3 -c "import delta; import psycopg2; print('OK')"
+```
 
 ## Preuves que l'infra fonctionne (capturées le 09/07)
 
 **Conteneurs up :**
-```
 NAME                      STATUS
 capteurs-kafka            Up (127.0.0.1:9092)
 capteurs-postgres         Up (127.0.0.1:5432)
 capteurs-spark-master     Up (127.0.0.1:4040, 7077, 8080)
 capteurs-spark-worker-1   Up
-```
 
 **Schéma Postgres créé (`\dt gold.*`) :**
-```
- Schema |         Name         | Type  |  Owner
+Schema |         Name         | Type  |  Owner
 --------+----------------------+-------+----------
- gold   | agg_fenetre_machine  | table | capteurs
- gold   | dim_capteur          | table | capteurs
- gold   | dim_machine          | table | capteurs
- gold   | dim_site             | table | capteurs
- gold   | etat_courant_capteur | table | capteurs
+gold   | agg_fenetre_machine  | table | capteurs
+gold   | dim_capteur          | table | capteurs
+gold   | dim_machine          | table | capteurs
+gold   | dim_site             | table | capteurs
+gold   | etat_courant_capteur | table | capteurs
 (5 rows)
-```
 
 **Référentiel chargé (`SELECT * FROM gold.dim_machine;`) :**
-```
- machine_id |    type_machine    | ligne_production | criticite | ... | site_id
+machine_id |    type_machine    | ligne_production | criticite | ... | site_id
 ------------+--------------------+------------------+-----------+-----+-------------
- m-01       | presse hydraulique | ligne-A          | haute     | ... | site-lyon
- m-02       | convoyeur          | ligne-A          | moyenne   | ... | site-lyon
- m-03       | compresseur        | ligne-B          | haute     | ... | site-lyon
- m-04       | presse hydraulique | ligne-C          | haute     | ... | site-nantes
- m-05       | convoyeur          | ligne-C          | basse     | ... | site-nantes
- m-06       | compresseur        | ligne-D          | moyenne   | ... | site-nantes
+m-01       | presse hydraulique | ligne-A          | haute     | ... | site-lyon
+m-02       | convoyeur          | ligne-A          | moyenne   | ... | site-lyon
+m-03       | compresseur        | ligne-B          | haute     | ... | site-lyon
+m-04       | presse hydraulique | ligne-C          | haute     | ... | site-nantes
+m-05       | convoyeur          | ligne-C          | basse     | ... | site-nantes
+m-06       | compresseur        | ligne-D          | moyenne   | ... | site-nantes
 (6 rows)
-```
+
+**Dépendances Spark confirmées (`import delta; import psycopg2`) :** `OK`
 
 ## À transmettre à B, C, D
 
@@ -107,12 +111,14 @@ capteurs-spark-worker-1   Up
 - **Chemin Delta** : `/lakehouse/...` dans les conteneurs Spark (volume
   partagé bind mount `./lakehouse`), pas de vrai HDFS — choix assumé pour un
   environnement laptop 16 Go.
+- **`delta-spark`/`psycopg2` déjà dans l'image `spark-master`** — rien à
+  installer manuellement.
 - **⚠️ Conflits de port fréquents** : si vous avez d'anciens TP qui tournent
   encore (Spark/Airflow/HDFS d'un TP précédent), `docker compose up` peut
   échouer sur les ports `7077`/`8080`/`9092`/`5432`. Voir Incident ci-dessous
   pour la marche à suivre.
 
-## Incident rencontré
+## Incident 1 (résolu) — Conflits de port au premier lancement
 
 **Problème** : au premier `docker compose up -d`, deux conflits de port
 successifs :
@@ -139,3 +145,18 @@ arrêtés (`docker stop`, pas supprimés) pour libérer la RAM sur la contrainte
 semestre ont pu laisser des conteneurs actifs en arrière-plan, toujours
 vérifier `docker ps -a` avant un premier `docker compose up` sur un nouveau
 projet.
+
+## Incident 2 (résolu) — dépendances Spark non persistées
+
+**Problème** : `delta-spark`/`psycopg2-binary` installés via
+`docker exec -u root -it capteurs-spark-master pip install ...` ne survivaient
+pas à une recréation du conteneur (`docker compose down` puis `up`) — seul un
+`restart` simple les conservait. Risque que B/C/D voient leurs jobs planter
+avec une erreur d'import si le conteneur est un jour recréé sans repasser par
+cette commande.
+
+**Résolution** : création de `docker/spark-master.Dockerfile` qui fige ces
+dépendances dans l'image (`docker compose build spark-master`). Le service
+`spark-master` du `docker-compose.yml` pointe maintenant sur ce Dockerfile
+plutôt que sur l'image `apache/spark:3.5.1-python3` brute. Vérifié avec
+`docker exec -it capteurs-spark-master python3 -c "import delta; import psycopg2"`.
