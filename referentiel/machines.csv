@@ -1,0 +1,7 @@
+machine_id,type_machine,ligne_production,criticite,date_mise_service,capacite_nominale,responsable_technique,site_id
+m-01,presse hydraulique,ligne-A,haute,2021-06-01,500,J. Dupont,site-lyon
+m-02,convoyeur,ligne-A,moyenne,2020-09-15,1200,S. Martin,site-lyon
+m-03,compresseur,ligne-B,haute,2022-02-10,800,J. Dupont,site-lyon
+m-04,presse hydraulique,ligne-C,haute,2021-11-20,500,A. Lefevre,site-nantes
+m-05,convoyeur,ligne-C,basse,2019-05-03,1000,A. Lefevre,site-nantes
+m-06,compresseur,ligne-D,moyenne,2023-01-17,900,C. Rousseau,site-nantes

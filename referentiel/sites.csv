@@ -1,0 +1,3 @@
+site_id,nom,region,capacite_site,fuseau_horaire,responsable_site
+site-lyon,Lyon Usine 1,Auvergne-Rhône-Alpes,3000,Europe/Paris,M. Bernard
+site-nantes,Nantes Usine 2,Pays de la Loire,1800,Europe/Paris,L. Petit

@@ -1,0 +1,21 @@
+# Environnements Python
+venv/
+.venv/
+venv-*/
+__pycache__/
+*.pyc
+
+# Données Delta / lakehouse (générées à l'exécution, pas versionnées)
+lakehouse/*
+!lakehouse/.gitkeep
+
+# Volumes Docker persistés en local (si jamais montés en bind mount ailleurs)
+pgdata/
+
+# OS / éditeur
+.DS_Store
+.vscode/settings.json
+*.swp
+
+# Fichiers de credentials éventuels
+.env

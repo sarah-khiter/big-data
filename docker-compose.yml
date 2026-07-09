@@ -1,0 +1,83 @@
+version: "3.9"
+
+services:
+  # ---------------------------------------------------------------
+  # KAFKA (mode KRaft, sans ZooKeeper) — deux listeners :
+  #   - PLAINTEXT (localhost:9092) pour le générateur qui tourne sur l'hôte
+  #   - INTERNAL  (kafka:29092)    pour que Spark (dans son conteneur) joigne Kafka
+  # ---------------------------------------------------------------
+  kafka:
+    image: apache/kafka:3.7.0
+    container_name: capteurs-kafka
+    hostname: kafka
+    ports:
+      - "127.0.0.1:9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,INTERNAL://kafka:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+  # ---------------------------------------------------------------
+  # SPARK STANDALONE (1 master, 1 worker) — 2G/2 coeurs pour tenir sur 16 Go de RAM
+  # ---------------------------------------------------------------
+  spark-master:
+    image: apache/spark:3.5.1-python3
+    container_name: capteurs-spark-master
+    hostname: spark-master
+    environment:
+      - SPARK_LOCAL_HOSTNAME=spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    depends_on:
+      - kafka
+      - postgres
+    ports:
+      - "127.0.0.1:8080:8080"   # Spark master UI
+      - "127.0.0.1:7077:7077"   # spark:// endpoint
+      - "127.0.0.1:4040:4040"   # Spark UI (job en cours)
+    volumes:
+      - ./jobs:/jobs
+      - ./lakehouse:/lakehouse
+      - ./referentiel:/referentiel
+
+  spark-worker-1:
+    image: apache/spark:3.5.1-python3
+    container_name: capteurs-spark-worker-1
+    hostname: spark-worker-1
+    environment:
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+      - SPARK_LOCAL_HOSTNAME=spark-worker-1
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    depends_on:
+      - spark-master
+    volumes:
+      - ./jobs:/jobs
+      - ./lakehouse:/lakehouse
+      - ./referentiel:/referentiel
+
+  # ---------------------------------------------------------------
+  # POSTGRES — couche de service pour Power BI (Gold Delta reste la source
+  # de vérité versionnée ; Postgres est alimenté en upsert depuis les jobs Gold)
+  # Exposé sur 127.0.0.1 pour que Power BI Desktop (hors Docker) puisse s'y connecter.
+  # ---------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: capteurs-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: capteurs
+      POSTGRES_PASSWORD: capteurs
+      POSTGRES_DB: capteurs
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:
