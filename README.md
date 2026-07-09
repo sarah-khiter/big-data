@@ -157,12 +157,15 @@ docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
 docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
   --packages io.delta:delta-spark_2.12:3.2.0 \
+  --conf spark.hadoop.fs.permissions.umask-mode=000 \
   /jobs/gold_etat_courant.py
 ```
-⚠️ Pas de `groupBy`/watermark streaming dans ce job (déduplication "dernière
-valeur" faite dans le micro-batch statique via `foreachBatch`) — ne devrait
-pas nécessiter le `--conf spark.hadoop.fs.permissions.umask-mode=000` requis
-pour Silver/Gold 1 (cf. Incident rôle C). L'ajouter en cas d'erreur `mkdir`.
+⚠️ Ce job n'a pourtant **aucun** `groupBy`/watermark streaming (déduplication
+"dernière valeur" faite dans le micro-batch statique via `foreachBatch`) —
+mais le `--conf spark.hadoop.fs.permissions.umask-mode=000` reste
+**obligatoire** : le conflit de permission driver(root)/executor documenté
+par C touche en fait toute création de table Delta, pas seulement le state
+store d'un opérateur stateful. Voir Incident 1, `README_role_D.md`.
 ⚠️ **Contrainte 2 cœurs (1 seul worker)** : chaque job streaming consomme par
 défaut tous les cœurs disponibles. Sur cette machine (`SPARK_WORKER_CORES=2`),
 Bronze + Silver + Gold 1 n'ont pas pu tourner **simultanément** — voir
@@ -232,13 +235,16 @@ vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
       aucun doublon introduit ni aucune perte
 - Détail complet des commandes/logs : `README_role_C.md`
 
-### Gold — Gold 1 fait (rôle C, 09/07) / Gold 2 en cours (rôle D)
+### Gold — Gold 1 fait (rôle C, 09/07) / Gold 2 fait (rôle D, 09/07)
 - [x] Table `agg_fenetre_machine` peuplée et mise à jour dans le temps :
       12 lignes (6 machines × 2 fenêtres) après la 1ère vague → **24 lignes**
       après la 2ᵉ (nouvelles fenêtres insérées, anciennes conservées)
-- [ ] Table état courant (Gold 2) peuplée — job écrit
-      (`jobs/gold_etat_courant.py`), *preuve d'exécution à capturer par D*,
-      voir `README_role_D.md`
+- [x] Table état courant `etat_courant_capteur` (Gold 2) peuplée et mise à
+      jour : **24 lignes** (une par capteur, cardinalité fixe) après la 1ère
+      **et** la 2ᵉ vague — contrairement à Gold 1, le nombre de lignes ne
+      grossit pas, seul `derniere_maj` avance et les valeurs sont
+      remplacées, confirmant un vrai "état courant". Détail complet :
+      `README_role_D.md`.
 - [x] **`DESCRIBE HISTORY` exécutée avec succès** sur `gold/agg_fenetre_machine`
       (preuve obligatoire) :
   ```
@@ -251,11 +257,24 @@ vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
   comportement upsert réel côté Delta, en plus de l'upsert Postgres
   (`ON CONFLICT (machine_id, window_start) DO UPDATE`, vérifié par
   `SELECT * FROM gold.agg_fenetre_machine`).
+- [x] **`DESCRIBE HISTORY` exécutée avec succès** sur `gold/etat_courant_capteur` :
+  ```
+  version | operation | operationParameters
+  2       | MERGE     | matchedPredicates=[update: derniere_maj >= ...], notMatchedPredicates=[insert]
+  1       | MERGE     | matchedPredicates=[update: derniere_maj >= ...], notMatchedPredicates=[insert]
+  0       | WRITE     | mode=Overwrite (création table vide au démarrage du job)
+  COUNT= 24
+  ```
+  Version 1 = insert des 24 capteurs (vague 1), version 2 = update des mêmes
+  24 (vague 2), garde de fraîcheur (`derniere_maj >= ...`) visible dans les
+  paramètres — en plus de l'upsert Postgres (`ON CONFLICT (capteur_id) DO
+  UPDATE ... WHERE EXCLUDED.derniere_maj >= ...`).
 
-### Power BI — en cours (rôle D)
+### Power BI — *TODO (rôle D)*
 - [ ] Capture du dashboard avec KPIs à jour — connexion DirectQuery et modèle
-      documentés dans `README_role_D.md`, *capture à faire par D une fois
-      Gold 2 peuplé*
+      documentés dans `README_role_D.md`. Gold 2 est peuplé et prêt à être
+      branché ; la construction du dashboard Power BI Desktop (étape GUI)
+      reste à faire.
 
 ---
 

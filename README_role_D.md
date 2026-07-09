@@ -60,6 +60,7 @@ stream Silver).
 docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
   --master spark://spark-master:7077 \
   --packages io.delta:delta-spark_2.12:3.2.0 \
+  --conf spark.hadoop.fs.permissions.umask-mode=000 \
   /jobs/gold_etat_courant.py
 ```
 
@@ -68,22 +69,29 @@ Bronze/Silver/Gold 1 tournent déjà, ce job restera `WAITING` faute de cœurs
 libres. Le lancer par vagues (arrêter un job en cours, lancer celui-ci,
 capturer la preuve), comme fait pour Gold 1.
 
-Si l'erreur `mkdir ... state/... failed` (Incident 1, rôle C) apparaît malgré
-l'absence de `groupBy` streaming, ajouter par précaution :
-```bash
-  --conf spark.hadoop.fs.permissions.umask-mode=000
-```
+⚠️ Le `--conf spark.hadoop.fs.permissions.umask-mode=000` est **obligatoire**
+ici — voir Incident 1 ci-dessous : le problème touche cette fois l'écriture
+de la table Gold elle-même (pas seulement un state store stateful).
 
-## Preuves — *à capturer à l'exécution*
+## Preuves (capturées le 09/07/2026, deux vagues de test 400 puis +300
+événements injectés via `kafka-console-producer`, cf. `README_role_C.md`
+Incident 3 pour le contournement Windows)
 
 ### Table Gold 2 peuplée et mise à jour (Postgres)
 ```sql
 SELECT capteur_id, derniere_valeur, dernier_statut_anomalie, derniere_maj
 FROM gold.etat_courant_capteur ORDER BY capteur_id;
 ```
-Attendu : 24 lignes (une par capteur, cardinalité fixe — contrairement à
-Gold 1 qui accumule des fenêtres dans le temps), `derniere_maj` qui avance à
-chaque nouvelle vague d'injection.
+```
+ nb_lignes | derniere_maj_la_plus_recente
+-----------+------------------------------
+        24 | 2026-07-09 15:33:45.991
+```
+24 lignes après la 1ère vague **et** après la 2ᵉ (cardinalité fixe — à la
+différence de Gold 1 qui accumule des fenêtres). `derniere_maj` avance bien
+de la vague 1 (15:03:43) à la vague 2 (15:33:45) et les valeurs changent
+(ex. `cpt-001` : 41.6 → 57.7), confirmant que le `MERGE INTO` met à jour les
+lignes existantes plutôt que d'accumuler.
 
 ### `DESCRIBE HISTORY` (preuve obligatoire)
 ```bash
@@ -94,13 +102,25 @@ docker exec capteurs-spark-master /opt/spark/bin/spark-submit \
   --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
   /jobs/describe_gold_etat.py
 ```
-Attendu : plusieurs versions `MERGE`, une par vague de données non vide.
+```
+version | timestamp              | operation | operationParameters
+2       | 2026-07-09 21:55:19.911| MERGE     | matchedPredicates=[update: derniere_maj >= ...], notMatchedPredicates=[insert]
+1       | 2026-07-09 15:58:34.627| MERGE     | matchedPredicates=[update: derniere_maj >= ...], notMatchedPredicates=[insert]
+0       | 2026-07-09 15:57:05.409| WRITE     | mode=Overwrite (création table vide au démarrage du job)
+COUNT= 24
+```
+Version 1 = insert des 24 capteurs (vague 1, table vide au départ) ; version 2
+= update des 24 mêmes capteurs (vague 2) — confirme le comportement upsert
+réel côté Delta, avec la garde de fraîcheur (`derniere_maj >= ...`) visible
+dans `operationParameters`, en plus de l'upsert Postgres (`ON CONFLICT
+(capteur_id) DO UPDATE ... WHERE EXCLUDED.derniere_maj >= ...`).
 
 ### Spark UI
-Capture `localhost:8080` montrant `gold_etat_courant_capteur` en `RUNNING`.
+Capture `localhost:8080` (ou `8081` en local si conflit de port avec un autre
+TP, cf. Incident 2) montrant `gold_etat_courant_capteur` en `RUNNING`.
 
 ### Power BI
-Voir section suivante — capture du dashboard avec KPIs à jour.
+Voir section suivante — capture du dashboard avec KPIs à jour, *à faire*.
 
 ## Power BI Desktop
 
@@ -126,7 +146,67 @@ Voir section suivante — capture du dashboard avec KPIs à jour.
    - Dernier statut par capteur : table `etat_courant_capteur` avec mise en
      forme conditionnelle sur `dernier_statut_anomalie`
 
-## Incidents — *à documenter au fil de l'eau*
+## Incidents
 
-*(compléter ici tout problème réel rencontré lors du lancement du job ou de
-la connexion Power BI, sur le modèle des Incidents 1-3 de `README_role_C.md`)*
+### Incident 1 — `Permission denied` à l'écriture de la table Gold elle-même
+
+**Problème** : au tout premier lancement, `gold_etat_courant.py` plantait
+dès le premier micro-batch avec :
+```
+java.io.FileNotFoundException: /lakehouse/gold/etat_courant_capteur/part-00000-....snappy.parquet (Permission denied)
+```
+alors que le job n'a **aucun** opérateur stateful (pas de `groupBy`/watermark
+sur le stream) — je pensais donc, à tort, être à l'abri du problème documenté
+par C (Incident 1 de `README_role_C.md`, spécifique au state store).
+
+**Diagnostic** : le même mécanisme s'applique en fait à **toute** création de
+répertoire Delta, pas seulement au state store. `ensure_gold_table()` crée le
+répertoire `/lakehouse/gold/etat_courant_capteur` (mode `755`, propriétaire
+`root`) depuis le driver (conteneur `spark-master`, process `root`), mais
+l'écriture effective des fichiers Parquet lors du `MERGE INTO` est faite par
+l'**executor** (conteneur `spark-worker-1`, utilisateur différent) — qui n'a
+pas le droit d'écrire dans un dossier `root:root 755`.
+
+**Résolution** : ajout de `--conf spark.hadoop.fs.permissions.umask-mode=000`
+au `spark-submit`, comme pour Silver/Gold 1. Après nettoyage du répertoire
+Gold partiellement créé (`rm -rf /lakehouse/gold/etat_courant_capteur` et
+`.../checkpoints/gold_etat_courant_capteur`) et relance avec cette conf, le
+job a démarré sans erreur.
+
+**Leçon** : la conf `umask-mode=000` doit être ajoutée par défaut à **tout**
+job Spark qui écrit une nouvelle table Delta dans ce projet (bind mount
+Docker + driver root / executor non-root), que le job soit stateful ou non
+au sens Structured Streaming — pas seulement pour le state store comme
+documenté initialement par C.
+
+### Incident 2 — Conflit de port 8080 avec un autre TP (environnement Windows)
+
+**Problème** : `docker compose up -d` a échoué sur `Bind for 0.0.0.0:8080
+failed: port is already allocated` — un conteneur Airflow d'un autre TP
+(`lakehouse-fx-tp-airflow-webserver-1`) tournait déjà sur ce port depuis
+plusieurs jours.
+
+**Résolution** : remapping local du port du Spark Master UI vers `8081`
+(`127.0.0.1:8081:8080` dans `docker-compose.yml`) plutôt que d'arrêter le
+conteneur de l'autre TP. Pas de changement fonctionnel côté pipeline, juste
+un port d'accès différent pour l'UI.
+
+**Leçon** : même leçon que l'Incident 1 du rôle A (`docker ps -a` avant tout
+premier lancement) — particulièrement vrai sur une machine qui fait tourner
+plusieurs projets Docker en parallèle.
+
+### Incident 3 — Kill du job via `docker exec -d` / `TaskStop` insuffisant
+
+**Problème** : arrêter le processus qui a lancé `docker exec -d ... spark-submit`
+(ou tuer le process client local) ne stoppe **pas** le driver Spark à
+l'intérieur du conteneur — l'application restait `RUNNING` côté Spark
+Master UI même après l'arrêt du client.
+
+**Résolution** : tuer explicitement le process driver *dans* le conteneur :
+```bash
+docker exec capteurs-spark-master bash -c "kill \$(pgrep -f SparkSubmit)"
+```
+
+**Leçon** : `docker exec -d` détache complètement la commande du process
+client — un `kill` côté client ou côté outil d'orchestration n'atteint jamais
+le process réellement exécuté dans le conteneur.
