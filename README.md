@@ -63,7 +63,9 @@ pression). Voir `referentiel/*.csv` et `scripts/generate_referentiel.py`.
   mesures `valeur_moyenne`, `valeur_max`, `nb_mesures`, `nb_anomalies` — FK
   implicite vers `dim_machine`
 - Table de faits **Gold 2** `etat_courant_capteur` (rôle D) : grain = 1 ligne
-  par `capteur_id` (dernière valeur/statut connu) — *à compléter par D*
+  par `capteur_id` (dernière valeur/statut connu), déduplication faite dans
+  le micro-batch (`foreachBatch`) plutôt que par état streaming — pas de
+  `groupBy`/watermark sur le stream lui-même, contrairement à Gold 1
 - Dimensions : `dim_capteur`, `dim_machine`, `dim_site` (déjà en place),
   pas de `dim_temps` séparée — le temps est porté directement par
   `window_start`/`window_end` et `event_ts` (pas de besoin de rollup calendaire
@@ -152,19 +154,32 @@ docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
   /jobs/gold_agg_fenetre.py
 
 # Gold 2 — état courant par capteur (D)
-# TODO
+docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages io.delta:delta-spark_2.12:3.2.0 \
+  /jobs/gold_etat_courant.py
 ```
+⚠️ Pas de `groupBy`/watermark streaming dans ce job (déduplication "dernière
+valeur" faite dans le micro-batch statique via `foreachBatch`) — ne devrait
+pas nécessiter le `--conf spark.hadoop.fs.permissions.umask-mode=000` requis
+pour Silver/Gold 1 (cf. Incident rôle C). L'ajouter en cas d'erreur `mkdir`.
 ⚠️ **Contrainte 2 cœurs (1 seul worker)** : chaque job streaming consomme par
 défaut tous les cœurs disponibles. Sur cette machine (`SPARK_WORKER_CORES=2`),
 Bronze + Silver + Gold 1 n'ont pas pu tourner **simultanément** — voir
 `README_role_C.md` pour le détail de la stratégie de preuve (jobs lancés par
 vagues successives, chacun reprenant sur son propre checkpoint).
 
-### 6. Power BI — *TODO (rôle D)*
+### 6. Power BI — rôle D
 ```
 Obtenir les données → PostgreSQL → localhost:5432 → base "capteurs"
 Mode DirectQuery recommandé
+Tables : gold.dim_capteur, gold.dim_machine, gold.dim_site,
+         gold.agg_fenetre_machine, gold.etat_courant_capteur
 ```
+Relations à créer manuellement dans la vue "Modèle" (schéma en étoile, cf.
+`README_role_D.md` pour le détail) : `dim_site`→`dim_machine`,
+`dim_machine`→`agg_fenetre_machine`, `dim_machine`/`dim_capteur`/`dim_site`
+→`etat_courant_capteur`.
 
 ---
 
@@ -217,11 +232,13 @@ vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
       aucun doublon introduit ni aucune perte
 - Détail complet des commandes/logs : `README_role_C.md`
 
-### Gold — Gold 1 fait (rôle C, 09/07) / Gold 2 *TODO (rôle D)*
+### Gold — Gold 1 fait (rôle C, 09/07) / Gold 2 en cours (rôle D)
 - [x] Table `agg_fenetre_machine` peuplée et mise à jour dans le temps :
       12 lignes (6 machines × 2 fenêtres) après la 1ère vague → **24 lignes**
       après la 2ᵉ (nouvelles fenêtres insérées, anciennes conservées)
-- [ ] Table état courant (Gold 2) peuplée — *TODO rôle D*
+- [ ] Table état courant (Gold 2) peuplée — job écrit
+      (`jobs/gold_etat_courant.py`), *preuve d'exécution à capturer par D*,
+      voir `README_role_D.md`
 - [x] **`DESCRIBE HISTORY` exécutée avec succès** sur `gold/agg_fenetre_machine`
       (preuve obligatoire) :
   ```
@@ -235,8 +252,10 @@ vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
   (`ON CONFLICT (machine_id, window_start) DO UPDATE`, vérifié par
   `SELECT * FROM gold.agg_fenetre_machine`).
 
-### Power BI — *TODO (rôle D)*
-- [ ] Capture du dashboard avec KPIs à jour
+### Power BI — en cours (rôle D)
+- [ ] Capture du dashboard avec KPIs à jour — connexion DirectQuery et modèle
+      documentés dans `README_role_D.md`, *capture à faire par D une fois
+      Gold 2 peuplé*
 
 ---
 
