@@ -19,3 +19,6 @@ pgdata/
 
 # Fichiers de credentials éventuels
 .env
+
+# Override local (ex. remapping de port en cas de conflit avec un autre TP) — jamais partagé
+docker-compose.override.yml
