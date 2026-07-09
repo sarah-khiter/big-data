@@ -6,8 +6,8 @@
 |---|---|---|
 | 1. Architecture | A (infra) + C/D (modélisation Gold) | 🟡 |
 | 2. Lancement | A + B/C/D (chacun ajoute son job) | 🟡 |
-| 3. Preuves | Chacun pour son étage | 🔴 |
-| 4. Justifications | Collectif | 🔴 |
+| 3. Preuves | Chacun pour son étage | 🟡 |
+| 4. Justifications | Collectif | 🟡 |
 | 5. Incident | Tout le monde, au fil de l'eau | 🟡 |
 
 ---
@@ -57,11 +57,20 @@ Générateur capteurs (Python, hôte)
 (`cpt-001` à `cpt-024`, 4 par machine : 2 température, 1 vibration, 1
 pression). Voir `referentiel/*.csv` et `scripts/generate_referentiel.py`.
 
-### Modélisation Gold (schéma en étoile) — *à compléter par C/D*
-- Table de faits : `TODO` (grain, mesures, clés étrangères)
+### Modélisation Gold (schéma en étoile)
+- Table de faits **Gold 1** `agg_fenetre_machine` (rôle C) : grain = 1 ligne
+  par `(machine_id, window_start)`, fenêtre glissante 2 min / pas 1 min,
+  mesures `valeur_moyenne`, `valeur_max`, `nb_mesures`, `nb_anomalies` — FK
+  implicite vers `dim_machine`
+- Table de faits **Gold 2** `etat_courant_capteur` (rôle D) : grain = 1 ligne
+  par `capteur_id` (dernière valeur/statut connu) — *à compléter par D*
 - Dimensions : `dim_capteur`, `dim_machine`, `dim_site` (déjà en place),
-  `dim_temps` ? *(à décider)*
-- Partitionnement des tables Delta : `TODO` (ex. par date sur Bronze/Silver)
+  pas de `dim_temps` séparée — le temps est porté directement par
+  `window_start`/`window_end` et `event_ts` (pas de besoin de rollup calendaire
+  pour ce projet)
+- Partitionnement des tables Delta : Bronze et Silver partitionnés par
+  `event_date` (`to_date(event_ts)`) ; Gold non partitionné (volumétrie trop
+  faible par fenêtre pour que ça ait un intérêt)
 - Format des tables : Delta partout (Parquet + `_delta_log/`)
 
 ---
@@ -99,24 +108,57 @@ python3 scripts/load_referentiel.py
 docker exec -u root -it capteurs-spark-master pip install delta-spark==3.2.0 psycopg2-binary
 ```
 
-### 4. Lancer le générateur — *TODO (rôle B)*
+### 4. Lancer le générateur (rôle B)
 ```bash
-# TODO : commande exacte du générateur (mock ou officiel une fois fourni)
+chmod 777 lakehouse   # le worker Spark (uid spark) doit pouvoir écrire dedans
+pip install -r requirements-generator.txt
+python3 scripts/generateur_mesures.py
+# options utiles : --taux-anomalie 0.15   --max-events 200 (pour un run fini)
 ```
+⚠️ **Sous Windows** : `kafka-python` échoue au bootstrap
+(`KafkaTimeoutError`/`NoBrokersAvailable`) quelle que soit la version testée
+(2.0.2 / 2.1.5 / 3.0.7), alors que Kafka est bien joignable en TCP. Cause
+probable : incompatibilité de la boucle non-bloquante de `kafka-python` avec
+Windows. Contournement utilisé pour tester B/C/D sur ce type de poste :
+injecter des messages JSON (même schéma) via le CLI du conteneur —
+```bash
+docker exec -i capteurs-kafka /opt/kafka/bin/kafka-console-producer.sh \
+  --broker-list localhost:9092 --topic mesures < fichier.jsonl
+```
+Voir `README_role_C.md` (Incident 3) pour le détail. Sous Linux/Mac, le
+générateur fonctionne normalement.
 
-### 5. Soumettre les jobs Spark — *TODO (rôles B/C/D)*
+### 5. Soumettre les jobs Spark
+
 ```bash
 # Bronze (B)
-docker exec -u root -it capteurs-spark-master /opt/spark/bin/spark-submit \
+docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
   --packages io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
-  /jobs/TODO_bronze.py
+  /jobs/bronze.py
 
-# Silver + Gold agrégation (C)
-# TODO
+# Silver (C) — dédoublonnage + is_anomalie
+docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages io.delta:delta-spark_2.12:3.2.0 \
+  --conf spark.hadoop.fs.permissions.umask-mode=000 \
+  /jobs/silver.py
 
-# Gold état courant (D)
+# Gold 1 — agrégation fenêtre glissante par machine (C)
+docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages io.delta:delta-spark_2.12:3.2.0 \
+  --conf spark.hadoop.fs.permissions.umask-mode=000 \
+  /jobs/gold_agg_fenetre.py
+
+# Gold 2 — état courant par capteur (D)
 # TODO
 ```
+⚠️ **Contrainte 2 cœurs (1 seul worker)** : chaque job streaming consomme par
+défaut tous les cœurs disponibles. Sur cette machine (`SPARK_WORKER_CORES=2`),
+Bronze + Silver + Gold 1 n'ont pas pu tourner **simultanément** — voir
+`README_role_C.md` pour le détail de la stratégie de preuve (jobs lancés par
+vagues successives, chacun reprenant sur son propre checkpoint).
 
 ### 6. Power BI — *TODO (rôle D)*
 ```
@@ -158,20 +200,40 @@ capteurs-spark-worker-1   Up
 **Référentiel chargé (`SELECT * FROM gold.dim_machine;`) :** 6 lignes
 vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
 
-### Kafka → Bronze — *TODO (rôle B)*
-- [ ] Capture montrant les messages qui arrivent sur le topic
-- [ ] Count Bronze qui grossit dans le temps
-- [ ] Capture Spark UI (`localhost:4040`, onglet Structured Streaming)
+### Kafka → Bronze — fait (rôle B, vérifié par C le 09/07)
+- [x] Messages produits sur le topic `mesures` (400 puis +300, deux vagues)
+- [x] Count Bronze qui grossit dans le temps : `COUNT= 400` → `COUNT= 700`
+      après la 2ᵉ vague, job **relancé** entre les deux (checkpoint repris
+      sans perte ni doublon)
+- [x] Job visible dans Spark Master UI (`localhost:8080`) comme application
+      `bronze_mesures`, état `RUNNING`
 
-### Silver — *TODO (rôle C)*
-- [ ] Lignes avec `is_anomalie = true` présentes (pas supprimées)
-- [ ] Preuve du dédoublonnage (compter les doublons avant/après)
+### Silver — fait (rôle C, 09/07)
+- [x] Lignes avec `is_anomalie = true` présentes, rien n'est supprimé :
+      `COUNT= 700` / `COUNT anomalies= 100` (≈14,3 %, cohérent avec le taux
+      ~15 % injecté par le générateur)
+- [x] Dédoublonnage actif (`withWatermark` + `dropDuplicates(["event_id"])`) :
+      `COUNT` Silver == `COUNT` Bronze (700 == 700) après chaque vague, donc
+      aucun doublon introduit ni aucune perte
+- Détail complet des commandes/logs : `README_role_C.md`
 
-### Gold — *TODO (rôle C/D)*
-- [ ] Table agrégation fenêtre glissante peuplée
-- [ ] Table état courant peuplée, mise à jour visible dans le temps
-- [ ] `DESCRIBE HISTORY` ou `VERSION AS OF` exécutée avec succès sur une
-      table Gold Delta *(preuve obligatoire, à ne pas oublier)*
+### Gold — Gold 1 fait (rôle C, 09/07) / Gold 2 *TODO (rôle D)*
+- [x] Table `agg_fenetre_machine` peuplée et mise à jour dans le temps :
+      12 lignes (6 machines × 2 fenêtres) après la 1ère vague → **24 lignes**
+      après la 2ᵉ (nouvelles fenêtres insérées, anciennes conservées)
+- [ ] Table état courant (Gold 2) peuplée — *TODO rôle D*
+- [x] **`DESCRIBE HISTORY` exécutée avec succès** sur `gold/agg_fenetre_machine`
+      (preuve obligatoire) :
+  ```
+  version | operation | operationParameters
+  2       | MERGE     | matchedPredicates=[update], notMatchedPredicates=[insert]
+  1       | MERGE     | matchedPredicates=[update], notMatchedPredicates=[insert]
+  0       | WRITE     | mode=Overwrite (création table vide au démarrage du job)
+  ```
+  Deux `MERGE INTO` distincts (un par vague de données), confirmant le
+  comportement upsert réel côté Delta, en plus de l'upsert Postgres
+  (`ON CONFLICT (machine_id, window_start) DO UPDATE`, vérifié par
+  `SELECT * FROM gold.agg_fenetre_machine`).
 
 ### Power BI — *TODO (rôle D)*
 - [ ] Capture du dashboard avec KPIs à jour
@@ -190,10 +252,20 @@ un vrai flux, contrairement à un clickstream ou des transactions qui peuvent
 batch/streaming pour une donnée dont la valeur est avant tout temps réel.
 *(à développer/nuancer par l'équipe)*
 
-### Gestion du checkpoint — *TODO*
-- Un `checkpointLocation` par `writeStream`, jamais partagé entre deux jobs
-- Emplacement : `TODO` (chemin exact utilisé)
-- *(préciser ce qui a été testé : redémarrage d'un job, reprise sans perte/doublon ?)*
+### Gestion du checkpoint
+- Un `checkpointLocation` dédié par `writeStream`, jamais partagé entre deux
+  jobs :
+  - Bronze : `file:///lakehouse/checkpoints/bronze_mesures`
+  - Silver : `file:///lakehouse/checkpoints/silver_mesures`
+  - Gold 1 (agg fenêtre) : `file:///lakehouse/checkpoints/gold_agg_fenetre_machine`
+- **Testé réellement** (rôle C, 09/07) : le job Bronze a été arrêté puis
+  relancé entre deux vagues d'injection de messages. Le count Bronze est
+  passé de `400` à `700` (exactement `400 + 300` nouveaux messages), sans
+  aucun doublon ni perte détectée côté Silver (`COUNT` Silver == `COUNT`
+  Bronze à chaque vérification) → la reprise sur checkpoint fonctionne
+  correctement, `startingOffsets=earliest` + `failOnDataLoss=false` combinés
+  au checkpoint garantissent qu'aucun message Kafka n'est relu deux fois une
+  fois committé.
 
 ### Compaction des petits fichiers — *TODO*
 Chaque micro-batch écrit de nouveaux fichiers Parquet en streaming ; sans
@@ -239,7 +311,30 @@ la RAM sur la contrainte 16 Go.
 **Leçon** : toujours vérifier `docker ps -a` avant un premier lancement sur
 une machine ayant servi à plusieurs TP du semestre.
 
-### Incident 2 — *TODO (rôle B/C/D, à compléter au fil du projet)*
+### Incident 2 — `mkdir` refusé sur le state store Silver/Gold (rôle C)
+
+**Problème** : `silver.py` (dédoublonnage stateful) et `gold_agg_fenetre.py`
+(agrégation stateful) plantaient systématiquement après le premier
+micro-batch avec `java.io.IOException: mkdir of
+file:/lakehouse/checkpoints/.../state/0/1 failed`, alors que Bronze (rôle B,
+non stateful) tournait sans problème sur le même volume.
+
+**Diagnostic** : le driver (conteneur `spark-master`, process `root`) crée
+les dossiers de checkpoint de haut niveau en `755`. Le sous-dossier `state/`
+est écrit directement par l'**executor** (conteneur `spark-worker-1`,
+process `spark`, uid 185) — utilisateur différent, sans droit d'écriture.
+`chmod -R 777` et `umask 000` côté shell n'y changent rien : Hadoop
+(`RawLocalFileSystem.mkdirs()`) applique une permission fixe (`755`)
+indépendamment de l'umask du process appelant.
+
+**Résolution** : ajout de `--conf
+spark.hadoop.fs.permissions.umask-mode=000` au `spark-submit` — cette
+option-là est bien respectée par Hadoop (contrairement à l'umask OS) et rend
+les dossiers de checkpoint créés en `777`, accessibles à l'executor.
+
+**Leçon pour D** : si Gold 2 utilise un opérateur stateful (agrégat/dernière
+valeur avec watermark), ajouter ce `--conf` dès le premier lancement — voir
+`README_role_C.md` pour le détail complet.
 
 ---
 
