@@ -11,6 +11,7 @@ lakehouse/*
 
 # Volumes Docker persistés en local (si jamais montés en bind mount ailleurs)
 pgdata/
+kafka-data/
 
 # OS / éditeur
 .DS_Store

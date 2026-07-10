@@ -4,11 +4,17 @@
 
 | Section | Responsable(s) principal(aux) | Statut |
 |---|---|---|
-| 1. Architecture | A (infra) + C/D (modélisation Gold) | 🟡 |
-| 2. Lancement | A + B/C/D (chacun ajoute son job) | 🟡 |
-| 3. Preuves | Chacun pour son étage | 🟡 |
-| 4. Justifications | Collectif | 🟡 |
-| 5. Incident | Tout le monde, au fil de l'eau | 🟡 |
+| 1. Architecture | A (infra) + C/D (modélisation Gold) | 🟢 |
+| 2. Lancement | A + B/C/D (chacun ajoute son job) | 🟡 (Power BI manuel restant) |
+| 3. Preuves | Chacun pour son étage | 🟡 (Power BI restant) |
+| 4. Justifications | Collectif | 🟢 |
+| 5. Incident | Tout le monde, au fil de l'eau | 🟢 |
+
+**Ce qui reste réellement à faire : construire et capturer le dashboard
+Power BI (section 6 du Lancement / fin de la section Preuves) — nécessite
+Power BI Desktop, non disponible sur le poste utilisé pour développer/tester
+le reste du pipeline. Tout le reste (infra, Kafka, Bronze, Silver, Gold 1,
+Gold 2) est fait et vérifié.**
 
 ---
 
@@ -63,7 +69,7 @@ pression). Voir `referentiel/*.csv` et `scripts/generate_referentiel.py`.
   mesures `valeur_moyenne`, `valeur_max`, `nb_mesures`, `nb_anomalies` — FK
   implicite vers `dim_machine`
 - Table de faits **Gold 2** `etat_courant_capteur` (rôle D) : grain = 1 ligne
-  par `capteur_id` (dernière valeur/statut connu) — *à compléter par D*
+  par `capteur_id` (dernière valeur/statut connu)
 - Dimensions : `dim_capteur`, `dim_machine`, `dim_site` (déjà en place),
   pas de `dim_temps` séparée — le temps est porté directement par
   `window_start`/`window_end` et `event_ts` (pas de besoin de rollup calendaire
@@ -82,6 +88,16 @@ pression). Voir `referentiel/*.csv` et `scripts/generate_referentiel.py`.
 ### Prérequis
 - Docker + Docker Compose
 - Python 3.x + venv
+
+### Raccourci : tout lancer d'un coup
+```bash
+./scripts/run_all.sh --seed 300
+```
+Fait tout ce qui suit (infra, schéma, référentiel, les 4 jobs Spark par
+vagues de 2 — cf. Incident 4, injection de 300 événements de démo). Idempotent
+: peut être relancé sans dupliquer les jobs déjà actifs. Utile pour relancer
+rapidement une démo pendant la soutenance. Les étapes détaillées ci-dessous
+restent utiles pour comprendre/dépanner chaque brique séparément.
 
 ### 1. Infra
 ```bash
@@ -107,10 +123,13 @@ python3 scripts/load_referentiel.py
 ```bash
 docker exec -u root -it capteurs-spark-master pip install delta-spark==3.2.0 psycopg2-binary
 ```
+Plus nécessaire en pratique : `docker/spark-master.Dockerfile` fige déjà ces
+paquets dans l'image (`docker compose up -d --build`), cf. Incident 2 du
+rôle A ci-dessous.
 
-### 4. Lancer le générateur (rôle B)
+### 4. Préparer le volume lakehouse et lancer le générateur (rôle B)
 ```bash
-chmod 777 lakehouse   # le worker Spark (uid spark) doit pouvoir écrire dedans
+chmod -R 777 lakehouse   # le worker Spark (uid spark) doit pouvoir écrire dedans
 pip install -r requirements-generator.txt
 python3 scripts/generateur_mesures.py
 # options utiles : --taux-anomalie 0.15   --max-events 200 (pour un run fini)
@@ -152,19 +171,46 @@ docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
   /jobs/gold_agg_fenetre.py
 
 # Gold 2 — état courant par capteur (D)
-# TODO
+docker exec -d capteurs-spark-master /opt/spark/bin/spark-submit \
+  --master spark://spark-master:7077 \
+  --packages io.delta:delta-spark_2.12:3.2.0 \
+  --conf spark.hadoop.fs.permissions.umask-mode=000 \
+  /jobs/gold_etat_courant.py
 ```
 ⚠️ **Contrainte 2 cœurs (1 seul worker)** : chaque job streaming consomme par
 défaut tous les cœurs disponibles. Sur cette machine (`SPARK_WORKER_CORES=2`),
-Bronze + Silver + Gold 1 n'ont pas pu tourner **simultanément** — voir
-`README_role_C.md` pour le détail de la stratégie de preuve (jobs lancés par
-vagues successives, chacun reprenant sur son propre checkpoint).
+Bronze + Silver + Gold 1 + Gold 2 n'ont pas pu tourner **simultanément** —
+voir `README_role_C.md`/`README_role_D.md` pour le détail de la stratégie de
+preuve (jobs lancés par vagues successives, chacun reprenant sur son propre
+checkpoint). En production/avec plus de cœurs, soumettre chaque job avec
+`--total-executor-cores 1` pour qu'ils tournent en continu en parallèle.
 
-### 6. Power BI — *TODO (rôle D)*
+### 6. Power BI — *TODO, nécessite Power BI Desktop*
 ```
-Obtenir les données → PostgreSQL → localhost:5432 → base "capteurs"
-Mode DirectQuery recommandé
+Obtenir les données → Base de données → PostgreSQL → localhost:5432 → base "capteurs"
+Mode DirectQuery recommandé (données mises à jour en continu par les jobs Gold)
+Tables : gold.dim_capteur, gold.dim_machine, gold.dim_site,
+         gold.agg_fenetre_machine, gold.etat_courant_capteur
 ```
+Modèle (relations à créer dans l'onglet **Modèle**) :
+```
+dim_site (site_id) ──1─N── dim_machine (site_id)
+dim_machine (machine_id) ──1─N── agg_fenetre_machine (machine_id)
+dim_machine (machine_id) ──1─N── etat_courant_capteur (machine_id)
+dim_capteur (capteur_id) ──1─1── etat_courant_capteur (capteur_id)
+```
+KPIs attendus (mesures DAX prêtes à l'emploi — détail complet dans
+`README_role_D.md`) :
+- `Nb Anomalies (fenêtre) = SUM(agg_fenetre_machine[nb_anomalies])`
+- `Valeur Moyenne = AVERAGE(agg_fenetre_machine[valeur_moyenne])`
+- `Nb Capteurs Batterie Faible = CALCULATE(COUNTROWS(etat_courant_capteur), etat_courant_capteur[dernier_batterie_pct] < 20)`
+- Table/matrice "dernier statut par capteur" sur `etat_courant_capteur`
+
+⚠️ **Non exécuté** : Power BI Desktop n'est pas installé sur le poste utilisé
+pour développer/tester le pipeline (vérifié). C'est la seule étape du projet
+qui reste à faire par la première personne de l'équipe qui l'a installé —
+tout le reste (connexion, modèle, mesures) est documenté ci-dessus prêt à
+suivre pas à pas.
 
 ---
 
@@ -217,26 +263,48 @@ vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
       aucun doublon introduit ni aucune perte
 - Détail complet des commandes/logs : `README_role_C.md`
 
-### Gold — Gold 1 fait (rôle C, 09/07) / Gold 2 *TODO (rôle D)*
+### Gold — fait (Gold 1 rôle C 09/07, Gold 2 rôle D 10/07)
 - [x] Table `agg_fenetre_machine` peuplée et mise à jour dans le temps :
       12 lignes (6 machines × 2 fenêtres) après la 1ère vague → **24 lignes**
       après la 2ᵉ (nouvelles fenêtres insérées, anciennes conservées)
-- [ ] Table état courant (Gold 2) peuplée — *TODO rôle D*
-- [x] **`DESCRIBE HISTORY` exécutée avec succès** sur `gold/agg_fenetre_machine`
+- [x] Table `etat_courant_capteur` peuplée (**24 lignes = 24 capteurs**, une
+      seule par `capteur_id`) et **mise à jour dans le temps** vérifiée : sur
+      le même `capteur_id`, `derniere_maj` est passée de
+      `2026-07-09 13:39:46` à `2026-07-10 08:16:00` après une nouvelle vague
+      d'événements — la ligne est bien mise à jour en place (UPDATE), pas
+      dupliquée
+- [x] **`DESCRIBE HISTORY` exécutée avec succès** sur les deux tables Gold
       (preuve obligatoire) :
+
+  `gold/agg_fenetre_machine` :
   ```
   version | operation | operationParameters
   2       | MERGE     | matchedPredicates=[update], notMatchedPredicates=[insert]
   1       | MERGE     | matchedPredicates=[update], notMatchedPredicates=[insert]
   0       | WRITE     | mode=Overwrite (création table vide au démarrage du job)
   ```
-  Deux `MERGE INTO` distincts (un par vague de données), confirmant le
-  comportement upsert réel côté Delta, en plus de l'upsert Postgres
-  (`ON CONFLICT (machine_id, window_start) DO UPDATE`, vérifié par
-  `SELECT * FROM gold.agg_fenetre_machine`).
 
-### Power BI — *TODO (rôle D)*
+  `gold/etat_courant_capteur` :
+  ```
+  version | operation | operationParameters
+  2       | MERGE     | matchedPredicates=[{"predicate":"derniere_maj >= t.derniere_maj","actionType":"update"}], notMatchedPredicates=[insert]
+  1       | MERGE     | matchedPredicates=[{"predicate":"derniere_maj >= t.derniere_maj","actionType":"update"}], notMatchedPredicates=[insert]
+  0       | WRITE     | mode=Overwrite (création table vide au démarrage du job)
+  ```
+  Le prédicat conditionnel `derniere_maj >= t.derniere_maj` apparaît dans les
+  métadonnées de version elles-mêmes — preuve que le garde-fou anti-régression
+  (contre un micro-batch en retard) est réellement actif, pas juste écrit
+  dans le code. Deux usages distincts de `MERGE INTO` dans le projet (Gold 1
+  et Gold 2), chacun avec upsert Postgres correspondant vérifié par
+  `SELECT * FROM gold.agg_fenetre_machine` / `gold.etat_courant_capteur`.
+
+### Power BI — *TODO, non exécuté (Power BI Desktop indisponible sur le poste de dev)*
 - [ ] Capture du dashboard avec KPIs à jour
+- [ ] Capture du modèle (relations faits/dimensions)
+
+Connexion, modèle et mesures DAX entièrement documentés (section Lancement
+ci-dessus et `README_role_D.md`) — reste seulement à ouvrir Power BI Desktop,
+suivre les étapes et capturer le résultat.
 
 ---
 
@@ -258,6 +326,7 @@ batch/streaming pour une donnée dont la valeur est avant tout temps réel.
   - Bronze : `file:///lakehouse/checkpoints/bronze_mesures`
   - Silver : `file:///lakehouse/checkpoints/silver_mesures`
   - Gold 1 (agg fenêtre) : `file:///lakehouse/checkpoints/gold_agg_fenetre_machine`
+  - Gold 2 (état courant) : `file:///lakehouse/checkpoints/gold_etat_courant_capteur`
 - **Testé réellement** (rôle C, 09/07) : le job Bronze a été arrêté puis
   relancé entre deux vagues d'injection de messages. Le count Bronze est
   passé de `400` à `700` (exactement `400 + 300` nouveaux messages), sans
@@ -332,9 +401,72 @@ spark.hadoop.fs.permissions.umask-mode=000` au `spark-submit` — cette
 option-là est bien respectée par Hadoop (contrairement à l'umask OS) et rend
 les dossiers de checkpoint créés en `777`, accessibles à l'executor.
 
-**Leçon pour D** : si Gold 2 utilise un opérateur stateful (agrégat/dernière
-valeur avec watermark), ajouter ce `--conf` dès le premier lancement — voir
-`README_role_C.md` pour le détail complet.
+**Leçon pour D** : Gold 2 (`gold_etat_courant.py`) n'a **pas** d'opérateur
+stateful streaming, mais rencontre la **même erreur** au tout premier
+micro-batch — cette fois parce que c'est la table Delta vide elle-même
+(créée par le driver avant le démarrage du stream) que l'executor n'arrive
+pas à relire. Même fix (`--conf spark.hadoop.fs.permissions.umask-mode=000`),
+donc à appliquer **systématiquement** dès qu'un job Gold crée une table
+vide puis la merge, stateful ou non. Voir `README_role_D.md` pour le détail.
+
+### Incident 3 (résolu) — Kafka perdait tous ses messages au redémarrage de Docker Desktop
+
+**Problème** : après un redémarrage de Docker Desktop (VM relancée en cours
+de session), tous les conteneurs du projet ont été recréés. Le topic
+`mesures` est reparti **vide** (offset 0) alors que le checkpoint Bronze
+pointait encore vers l'ancien offset (700). Résultat :
+`WARN KafkaMicroBatchStream: Partition mesures-0's offset was changed from
+700 to 200, some data may have been missed`, puis le job Bronze restait
+bloqué sans progresser.
+
+**Cause racine** : `docker-compose.yml` ne déclarait **aucun volume** pour le
+service `kafka` (contrairement à `postgres` avec `pgdata`, et à
+Spark/`lakehouse` avec un bind mount). Toute recréation du conteneur Kafka
+effaçait donc l'intégralité des topics.
+
+**Résolution** : ajout d'un bind mount `./kafka-data:/tmp/kafka-logs`
+(chemin par défaut de `log.dirs` sur l'image `apache/kafka`, confirmé par
+`docker exec capteurs-kafka env | grep LOG_DIR`). Un **volume nommé** a été
+essayé en premier mais rejeté : Docker le crée `root:root`, alors que le
+conteneur Kafka tourne en `uid 1000` (`appuser`) → `Error while writing
+meta.properties file ... Permission denied` au démarrage. Le bind mount,
+comme pour `./lakehouse`, permet un `chmod -R 777 kafka-data` explicite côté
+hôte (fait automatiquement par `scripts/run_all.sh`).
+
+### Incident 4 (résolu) — 4 jobs Spark simultanés saturent la VM Docker Desktop
+
+**Problème** : en tentant de faire tourner les 4 jobs streaming (Bronze,
+Silver, Gold 1, Gold 2) **en même temps** (`SPARK_WORKER_CORES` porté à 4,
+`--total-executor-cores 1`/job), le démon Docker est devenu injoignable
+(`request returned 500 Internal Server Error` sur **tous** les appels
+`docker`, y compris `docker version`) après l'ajout d'une 5ᵉ requête
+ponctuelle (une vérification `local[1]`) par-dessus les 4 jobs.
+
+**Diagnostic** : `docker stats` montrait `capteurs-spark-master` à ~2 Go et
+`capteurs-spark-worker-1` à ~1,3 Go, sur une VM Docker Desktop limitée à
+**7,358 Go** (`docker info | grep "Total Memory"`) — pas les 16 Go du laptop
+hôte. Chaque `spark-submit` lance un driver JVM (défaut `1g` de heap, réduit
+à `512m` — en dessous, `SparkIllegalArgumentException: INVALID_DRIVER_MEMORY`
+car Spark exige un minimum d'environ 450 Mo). 4 drivers + 4 executors +
+requêtes ad-hoc ont fait déborder la VM ; les processus `com.docker.backend`
+sont restés vivants mais bloqués (CPU à 300%+, aucune réponse) — un simple
+restart de Docker Desktop a été nécessaire pour récupérer la main.
+
+**Résolution** : retour à `SPARK_WORKER_CORES=2` / `SPARK_WORKER_MEMORY=2G`
+dans `docker-compose.yml` — cette configuration a tourné sans le moindre
+souci pendant tout le reste du projet. C'est désormais une **limite dure du
+cluster** (2 cœurs au total), pas une simple politique de script : impossible
+de refaire l'erreur par accident. `scripts/run_all.sh` orchestre les 4 jobs
+**par vagues de 2 maximum** : Bronze+Silver tournent, absorbent les données,
+sont arrêtés ; puis Gold 1+Gold 2 tournent et consomment le Silver produit,
+et restent actifs (Postgres/Power BI restent à jour en continu tant
+qu'aucune nouvelle vague Bronze+Silver n'est relancée).
+
+**Leçon** : la contrainte réelle sur ce projet n'est pas le nombre de cœurs
+du laptop hôte (16 Go, largement suffisant) mais la RAM allouée par défaut à
+la VM Docker Desktop. Avant d'augmenter `SPARK_WORKER_CORES`, vérifier
+`docker info | grep "Total Memory"` et/ou augmenter cette allocation dans
+les paramètres de Docker Desktop (Settings → Resources).
 
 ---
 
