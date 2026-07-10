@@ -5,16 +5,14 @@
 | Section | Responsable(s) principal(aux) | Statut |
 |---|---|---|
 | 1. Architecture | A (infra) + C/D (modélisation Gold) | 🟢 |
-| 2. Lancement | A + B/C/D (chacun ajoute son job) | 🟡 (Power BI manuel restant) |
-| 3. Preuves | Chacun pour son étage | 🟡 (Power BI restant) |
+| 2. Lancement | A + B/C/D (chacun ajoute son job) | 🟢 |
+| 3. Preuves | Chacun pour son étage | 🟢 |
 | 4. Justifications | Collectif | 🟢 |
 | 5. Incident | Tout le monde, au fil de l'eau | 🟢 |
 
-**Ce qui reste réellement à faire : construire et capturer le dashboard
-Power BI (section 6 du Lancement / fin de la section Preuves) — nécessite
-Power BI Desktop, non disponible sur le poste utilisé pour développer/tester
-le reste du pipeline. Tout le reste (infra, Kafka, Bronze, Silver, Gold 1,
-Gold 2) est fait et vérifié.**
+**Pipeline complet, bout en bout : infra, Kafka, Bronze, Silver, Gold 1,
+Gold 2, et dashboard Power BI — tout est fait, testé et documenté avec
+preuves. Reste seulement une relecture collective avant la soutenance.**
 
 ---
 
@@ -185,32 +183,32 @@ preuve (jobs lancés par vagues successives, chacun reprenant sur son propre
 checkpoint). En production/avec plus de cœurs, soumettre chaque job avec
 `--total-executor-cores 1` pour qu'ils tournent en continu en parallèle.
 
-### 6. Power BI — *TODO, nécessite Power BI Desktop*
+### 6. Power BI — fait (10/07)
 ```
 Obtenir les données → Base de données → PostgreSQL → localhost:5432 → base "capteurs"
-Mode DirectQuery recommandé (données mises à jour en continu par les jobs Gold)
+Mode DirectQuery (données mises à jour en continu par les jobs Gold)
 Tables : gold.dim_capteur, gold.dim_machine, gold.dim_site,
          gold.agg_fenetre_machine, gold.etat_courant_capteur
 ```
-Modèle (relations à créer dans l'onglet **Modèle**) :
+Modèle (relations créées dans **Manage relationships**) :
 ```
 dim_site (site_id) ──1─N── dim_machine (site_id)
 dim_machine (machine_id) ──1─N── agg_fenetre_machine (machine_id)
 dim_machine (machine_id) ──1─N── etat_courant_capteur (machine_id)
-dim_capteur (capteur_id) ──1─1── etat_courant_capteur (capteur_id)
+dim_capteur (capteur_id) ──1─1── etat_courant_capteur (capteur_id)   [Both cross-filter, cf. Incident 5]
 ```
-KPIs attendus (mesures DAX prêtes à l'emploi — détail complet dans
-`README_role_D.md`) :
-- `Nb Anomalies (fenêtre) = SUM(agg_fenetre_machine[nb_anomalies])`
-- `Valeur Moyenne = AVERAGE(agg_fenetre_machine[valeur_moyenne])`
-- `Nb Capteurs Batterie Faible = CALCULATE(COUNTROWS(etat_courant_capteur), etat_courant_capteur[dernier_batterie_pct] < 20)`
-- Table/matrice "dernier statut par capteur" sur `etat_courant_capteur`
-
-⚠️ **Non exécuté** : Power BI Desktop n'est pas installé sur le poste utilisé
-pour développer/tester le pipeline (vérifié). C'est la seule étape du projet
-qui reste à faire par la première personne de l'équipe qui l'a installé —
-tout le reste (connexion, modèle, mesures) est documenté ci-dessus prêt à
-suivre pas à pas.
+Mesures DAX créées :
+```dax
+Nb Anomalies = SUM('gold agg_fenetre_machine'[nb_anomalies])
+Valeur Moyenne = AVERAGE('gold agg_fenetre_machine'[valeur_moyenne])
+Nb Batterie Faible = CALCULATE(COUNTROWS('gold etat_courant_capteur'), 'gold etat_courant_capteur'[dernier_batterie_pct] < 30)
+Nb Capteurs En Anomalie = CALCULATE(COUNTROWS('gold etat_courant_capteur'), 'gold etat_courant_capteur'[dernier_statut_anomalie] = TRUE())
+```
+5 visuels sur la page : histogramme "Nb Anomalies by type_machine", courbe
+"Valeur Moyenne by window_start and machine_id" (une série par machine),
+2 cartes KPI (Nb Batterie Faible, Nb Capteurs En Anomalie), table "dernier
+statut par capteur" (`capteur_id`, `derniere_valeur`, `dernier_statut_anomalie`,
+`derniere_maj`).
 
 ---
 
@@ -298,13 +296,21 @@ vérifiées, cohérentes avec les sites (`site-lyon`/`site-nantes`).
   et Gold 2), chacun avec upsert Postgres correspondant vérifié par
   `SELECT * FROM gold.agg_fenetre_machine` / `gold.etat_courant_capteur`.
 
-### Power BI — *TODO, non exécuté (Power BI Desktop indisponible sur le poste de dev)*
-- [ ] Capture du dashboard avec KPIs à jour
-- [ ] Capture du modèle (relations faits/dimensions)
+### Power BI — fait (10/07)
+- [x] Connexion PostgreSQL DirectQuery, 5 tables Gold chargées
+- [x] Modèle : 4 relations créées et vérifiées dans **Manage relationships**
+      (toutes `Active`), y compris `dim_capteur ↔ etat_courant_capteur` en
+      **One to one / Both** — cf. Incident 5 ci-dessous pour le bug rencontré
+      et corrigé sur cette relation précise
+- [x] 4 mesures DAX créées (`Nb Anomalies`, `Valeur Moyenne`,
+      `Nb Batterie Faible`, `Nb Capteurs En Anomalie`)
+- [x] Capture du dashboard avec les 5 visuels et données à jour (histogramme
+      anomalies/machine, courbe valeur moyenne/temps par machine, 2 cartes
+      KPI, table dernier statut par capteur)
+- [x] Capture du modèle (Manage relationships, 4 relations actives)
 
-Connexion, modèle et mesures DAX entièrement documentés (section Lancement
-ci-dessus et `README_role_D.md`) — reste seulement à ouvrir Power BI Desktop,
-suivre les étapes et capturer le résultat.
+*(Captures conservées par l'équipe — à insérer ici dans la version finale
+partagée du README, ou en annexe de la soutenance.)*
 
 ---
 
@@ -467,6 +473,35 @@ du laptop hôte (16 Go, largement suffisant) mais la RAM allouée par défaut à
 la VM Docker Desktop. Avant d'augmenter `SPARK_WORKER_CORES`, vérifier
 `docker info | grep "Total Memory"` et/ou augmenter cette allocation dans
 les paramètres de Docker Desktop (Settings → Resources).
+
+### Incident 5 (résolu) — relation Power BI 1:1 mal orientée, filtre non propagé
+
+**Problème** : dans le modèle Power BI, la table "dernier statut par
+capteur" (`etat_courant_capteur`) affichait la **même valeur de batterie
+(1456) pour les 24 capteurs** au lieu de la valeur individuelle de chacun.
+La mesure `Nb Batterie Faible` retournait `--` (blank) alors que des
+capteurs avaient bien une batterie basse dans les données.
+
+**Diagnostic** : la relation `dim_capteur (capteur_id) ↔
+etat_courant_capteur (capteur_id)` avait été créée par Power BI avec
+**Cardinality = "Many to one (*:1)"** et **Cross-filter direction =
+"Single"**, orientée de sorte que le filtre ne se propageait *pas* de
+`dim_capteur` vers `etat_courant_capteur`. Résultat : chaque ligne de la
+table affichait un total non filtré sur les 24 capteurs (`SUM` global =
+1456) au lieu de la valeur d'un seul capteur.
+
+**Résolution** : édition de la relation → **Cardinality = "One to one
+(1:1)"** (cohérent avec le fait que `capteur_id` est une clé unique dans les
+deux tables) + **Cross-filter direction = "Both"** (garantit la propagation
+du filtre dans les deux sens, indépendamment de l'orientation détectée
+automatiquement par Power BI). Vérifié : chaque capteur affiche désormais sa
+propre valeur (23 % à 93 % de batterie selon les capteurs).
+
+**Leçon** : en DirectQuery sur un schéma en étoile où une relation *devrait*
+être 1:1 (deux clés uniques), toujours vérifier explicitement la Cardinality
+détectée par Power BI plutôt que de faire confiance à l'auto-détection —
+"Many to one" silencieux sur une relation qui devrait être "One to one" ne
+génère aucune erreur visible, juste des résultats agrégés incorrects.
 
 ---
 
