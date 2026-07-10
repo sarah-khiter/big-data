@@ -20,9 +20,21 @@ services:
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
       KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    volumes:
+      # Persistance des topics (log.dirs par défaut de l'image) : sans ça, tout
+      # message est perdu au moindre `docker compose down`/recreate du conteneur
+      # (cf. README.md, Incident 3). Bind mount (comme ./lakehouse) plutôt qu'un
+      # volume nommé : l'image tourne en uid 1000 (`appuser`), un volume nommé
+      # est créé root:root par Docker et casse l'écriture — nécessite
+      # `chmod -R 777 kafka-data` sur l'hôte avant le premier démarrage.
+      - ./kafka-data:/tmp/kafka-logs
 
   # ---------------------------------------------------------------
-  # SPARK STANDALONE (1 master, 1 worker) — 2G/2 coeurs pour tenir sur 16 Go de RAM
+  # SPARK STANDALONE (1 master, 1 worker) — 2G/2 coeurs, contrainte réelle de
+  # la VM Docker Desktop (~7.3 Go alloués, pas les 16 Go du laptop hôte).
+  # Testé : 4 jobs simultanés (même à 600m/executor) ont saturé la VM et
+  # rendu le démon Docker injoignable (cf. README.md, Incident 4). Les 4 jobs
+  # tournent donc par vagues de 2 (voir scripts/run_all.sh), jamais 4 à la fois.
   # ---------------------------------------------------------------
   spark-master:
     build:
